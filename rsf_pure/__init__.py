@@ -12,8 +12,10 @@ Quick start
 >>> from rsf_pure import PureRandomSurvivalForest, pure_concordance_index
 >>> rsf = PureRandomSurvivalForest(n_estimators=50, random_state=0)
 >>> rsf.fit(X, time, event)
->>> S = rsf.predict_survival_function(X_test)
->>> risk = rsf.predict(X_test)
+>>> risk = rsf.predict(X_test)                      # (n,) like sksurv
+>>> S = rsf.predict_survival_function(X_test)       # StepFunction array
+>>> S_arr = rsf.predict_survival_function(X_test, return_array=True)
+>>> H = rsf.predict_cumulative_hazard_function(X_test, return_array=True)
 
 Custom criterion
 ----------------
