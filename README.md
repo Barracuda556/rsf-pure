@@ -4,19 +4,14 @@ Pure-Python **Random Survival Forest** (Ishwaran-style) with pluggable split cri
 
 All public names use the `Pure*` / `pure_*` prefix so this package can be used **alongside scikit-survival** without name clashes.
 
+Prediction API matches sksurv (`predict`, `predict_survival_function`, `predict_cumulative_hazard_function` with `return_array` and `StepFunction`).
+
 ## Install
 
 ```bash
 pip install numpy
-# optional: pip install numba   # speeds up log-rank
+# optional: pip install numba scikit-survival
 ```
-
-## Structure
-
-- `rsf_pure/criterion.py` — `PureSplitCriterion`, `PureLogRankCriterion`
-- `rsf_pure/tree.py` — `PureSurvivalTree`, `PureTreeNode`
-- `rsf_pure/rsf.py` — `PureRandomSurvivalForest`, `pure_concordance_index`
-- `rsf_pure/example_custom_criterion.py` — custom criterion example
 
 ## Quick start
 
@@ -25,9 +20,11 @@ from rsf_pure import PureRandomSurvivalForest, pure_concordance_index
 
 rsf = PureRandomSurvivalForest(n_estimators=100, criterion="logrank", random_state=0)
 rsf.fit(X, time, event)
-risk = rsf.predict(X_test)
-S = rsf.predict_survival_function(X_test)
-c = pure_concordance_index(time_test, event_test, risk)
+
+risk = rsf.predict(X_test)  # (n,) risk scores
+S = rsf.predict_survival_function(X_test, return_array=True)
+H = rsf.predict_cumulative_hazard_function(X_test, return_array=True)
+fns = rsf.predict_survival_function(X_test)  # array of StepFunction
 ```
 
 ## Side-by-side with sksurv
@@ -49,5 +46,3 @@ class MyCrit(PureSplitCriterion):
 
 rsf = PureRandomSurvivalForest(criterion=MyCrit(), n_estimators=50)
 ```
-
-Requires only NumPy (Numba optional).
