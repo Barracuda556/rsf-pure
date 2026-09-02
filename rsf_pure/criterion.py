@@ -1,11 +1,11 @@
 """
-Split criteria for survival trees.
+Split criteria for pure survival trees.
 
 Any criterion must expose:
     score(time, event, left_mask) -> float
 where higher score = better split.
 
-Also provides fast vectorized log-rank for a sorted feature.
+Names are prefixed with Pure* to avoid clashes with sksurv / sklearn.
 """
 
 from __future__ import annotations
@@ -15,9 +15,25 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+# Optional Numba acceleration (used if installed)
+try:
+    from numba import njit
 
-class SplitCriterion(ABC):
-    """Base class for node-splitting criteria."""
+    _HAS_NUMBA = True
+except ImportError:  # pragma: no cover
+    _HAS_NUMBA = False
+
+    def njit(*args, **kwargs):
+        def deco(fn):
+            return fn
+
+        if args and callable(args[0]):
+            return args[0]
+        return deco
+
+
+class PureSplitCriterion(ABC):
+    """Base class for node-splitting criteria (pure-RSF)."""
 
     name: str = "base"
 
@@ -66,10 +82,7 @@ class SplitCriterion(ABC):
         t_s = time[order]
         e_s = event[order]
 
-        # candidate split indices: after position i (0-based), left has i+1 samples
-        # skip identical values
         unique_idx = np.where(x_s[1:] != x_s[:-1])[0]
-        # left size = idx+1 must be >= min_leaf and n-(idx+1) >= min_leaf
         valid = (unique_idx + 1 >= min_leaf) & (n - (unique_idx + 1) >= min_leaf)
         cand = unique_idx[valid]
         if cand.size == 0:
@@ -78,18 +91,23 @@ class SplitCriterion(ABC):
         if max_candidates is not None and cand.size > max_candidates:
             if rng is None:
                 rng = np.random.default_rng()
-            cand = rng.choice(cand, size=max_candidates, replace=False)
-            cand.sort()
+            cand = np.sort(rng.choice(cand, size=max_candidates, replace=False))
+
+        # Sort by time once; evaluate each candidate without re-sorting
+        time_order = np.argsort(t_s, kind="mergesort")
+        t_time = t_s[time_order]
+        e_time = e_s[time_order].astype(np.float64)
 
         best_score = -np.inf
         best_thr = None
         best_i = None
 
         for i in cand:
-            left_mask_sorted = np.zeros(n, dtype=bool)
-            left_mask_sorted[: i + 1] = True
-            # map back? score only needs the groups in original order of t_s,e_s
-            sc = self.score(t_s, e_s, left_mask_sorted)
+            # left in feature-sorted order: indices 0..i
+            left_feat = np.zeros(n, dtype=np.bool_)
+            left_feat[: i + 1] = True
+            left_time = left_feat[time_order]
+            sc = _logrank_statistic_sorted(t_time, e_time, left_time)
             if sc > best_score:
                 best_score = sc
                 best_thr = 0.5 * (x_s[i] + x_s[i + 1])
@@ -98,18 +116,17 @@ class SplitCriterion(ABC):
         if best_i is None:
             return -np.inf, None, None
 
-        # reconstruct left_mask in original sample order
         left_mask = np.zeros(n, dtype=bool)
         left_mask[order[: best_i + 1]] = True
         return best_score, best_thr, left_mask
 
 
-class LogRankCriterion(SplitCriterion):
+class PureLogRankCriterion(PureSplitCriterion):
     """
-    Classic two-sample log-rank statistic (absolute value).
+    Classic two-sample log-rank statistic (|L|).
 
     L = sum (d_L - E[d_L]) / sqrt(sum Var)
-    We return |L| (or L^2); larger = stronger difference.
+    Larger |L| = stronger survival difference between child nodes.
     """
 
     name = "logrank"
@@ -120,101 +137,114 @@ class LogRankCriterion(SplitCriterion):
         event: np.ndarray,
         left_mask: np.ndarray,
     ) -> float:
-        return _logrank_statistic(time, event, left_mask)
+        return pure_logrank_statistic(time, event, left_mask)
+
+    def best_split_on_feature(
+        self,
+        x: np.ndarray,
+        time: np.ndarray,
+        event: np.ndarray,
+        min_leaf: int = 3,
+        max_candidates: Optional[int] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> Tuple[float, Optional[float], Optional[np.ndarray]]:
+        # Use optimized path from base (single time-sort + sorted log-rank)
+        return PureSplitCriterion.best_split_on_feature(
+            self, x, time, event, min_leaf, max_candidates, rng
+        )
 
 
-def _logrank_statistic(
-    time: np.ndarray,
-    event: np.ndarray,
-    left_mask: np.ndarray,
+@njit(cache=True)
+def _logrank_statistic_sorted(
+    t: np.ndarray,
+    e: np.ndarray,
+    left_s: np.ndarray,
 ) -> float:
     """
-    Compute |log-rank| for groups defined by left_mask.
-    Efficient single-pass over unique event times.
+    |log-rank| when `t` is already sorted ascending and `e`, `left_s`
+    are aligned with `t`. Pure loops for Numba compatibility.
     """
-    n = time.shape[0]
-    left = left_mask.astype(bool)
-    n_left = int(left.sum())
-    n_right = n - n_left
-    if n_left == 0 or n_right == 0:
+    n = t.shape[0]
+    n_left = 0
+    for i in range(n):
+        if left_s[i]:
+            n_left += 1
+    if n_left == 0 or n_left == n:
         return 0.0
 
-    # sort by time
-    order = np.argsort(time, kind="mergesort")
-    t = time[order]
-    e = event[order].astype(np.float64)
-    left_s = left[order]
-
-    # unique event times (only times where at least one event occurred)
-    event_times = np.unique(t[e > 0])
-    if event_times.size == 0:
-        return 0.0
-
-    # at-risk and deaths via reverse cumsum style
-    # We walk from earliest to latest
     num = 0.0
     den = 0.0
-
-    # pointers / precompute order indices
-    # For speed: compute Y and d at each distinct time using search
-    # Simple O(n + M) approach:
-    idx = 0
-    n_at_risk = n
-    n_at_risk_L = n_left
-
-    # group by unique times (all times, not only events)
-    unique_t, inv = np.unique(t, return_inverse=True)
-    # counts per unique time
-    n_unique = unique_t.size
-    deaths = np.zeros(n_unique, dtype=np.float64)
-    deaths_L = np.zeros(n_unique, dtype=np.float64)
-    drop = np.zeros(n_unique, dtype=np.float64)  # samples leaving at this time (event or censor)
-    drop_L = np.zeros(n_unique, dtype=np.float64)
-
-    for i in range(n):
-        j = inv[i]
-        drop[j] += 1.0
-        if left_s[i]:
-            drop_L[j] += 1.0
-        if e[i] > 0:
-            deaths[j] += 1.0
-            if left_s[i]:
-                deaths_L[j] += 1.0
-
     Y = float(n)
     Y_L = float(n_left)
 
-    for j in range(n_unique):
-        d = deaths[j]
-        d_L = deaths_L[j]
-        if d > 0 and Y > 1:
-            # expected deaths in left
+    i = 0
+    while i < n:
+        # group identical times
+        j = i + 1
+        while j < n and t[j] == t[i]:
+            j += 1
+        d = 0.0
+        d_L = 0.0
+        drop = 0.0
+        drop_L = 0.0
+        for k in range(i, j):
+            drop += 1.0
+            if left_s[k]:
+                drop_L += 1.0
+            if e[k] > 0.0:
+                d += 1.0
+                if left_s[k]:
+                    d_L += 1.0
+        if d > 0.0 and Y > 1.0:
             E = Y_L * (d / Y)
             num += d_L - E
-            # hypergeometric variance
-            factor = (Y - d) / (Y - 1.0) if Y > 1 else 0.0
+            factor = (Y - d) / (Y - 1.0)
             den += (Y_L / Y) * (1.0 - Y_L / Y) * d * factor
-        # remove those who had time = unique_t[j]
-        Y -= drop[j]
-        Y_L -= drop_L[j]
+        Y -= drop
+        Y_L -= drop_L
+        i = j
 
     if den <= 1e-12:
         return 0.0
     return abs(num) / np.sqrt(den)
 
 
-# Registry for easy extension
+def pure_logrank_statistic(
+    time: np.ndarray,
+    event: np.ndarray,
+    left_mask: np.ndarray,
+) -> float:
+    """Public log-rank helper (sorts by time, then calls sorted core)."""
+    n = time.shape[0]
+    left = np.asarray(left_mask, dtype=np.bool_)
+    n_left = int(left.sum())
+    if n_left == 0 or n_left == n:
+        return 0.0
+
+    order = np.argsort(time, kind="mergesort")
+    t = np.asarray(time, dtype=np.float64)[order]
+    e = np.asarray(event, dtype=np.float64)[order]
+    left_s = left[order]
+    return float(_logrank_statistic_sorted(t, e, left_s))
+
+
+# Back-compat alias used in examples
+_logrank_statistic = pure_logrank_statistic
+
+
 CRITERIA = {
-    "logrank": LogRankCriterion,
+    "logrank": PureLogRankCriterion,
 }
 
 
-def get_criterion(name_or_obj) -> SplitCriterion:
-    if isinstance(name_or_obj, SplitCriterion):
+def get_criterion(name_or_obj) -> PureSplitCriterion:
+    if isinstance(name_or_obj, PureSplitCriterion):
         return name_or_obj
     if isinstance(name_or_obj, str):
         key = name_or_obj.lower()
         if key not in CRITERIA:
-            raise ValueError(f"Unknown criterion '{name_or_obj}'. Available: {list(CRITERIA)}")
+            raise ValueError(
+                f"Unknown criterion '{name_or_obj}'. Available: {list(CRITERIA)}"
+            )
         return CRITERIA[key]()
-    raise TypeError("criterion must be str or SplitCriterion instance")
+    raise TypeError("criterion must be str or PureSplitCriterion instance")
