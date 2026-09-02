@@ -2,44 +2,52 @@
 
 Pure-Python **Random Survival Forest** (Ishwaran-style) with pluggable split criteria.
 
+All public names use the `Pure*` / `pure_*` prefix so this package can be used **alongside scikit-survival** without name clashes.
+
 ## Install
 
 ```bash
 pip install numpy
-# then use the rsf_pure package from this repo
+# optional: pip install numba   # speeds up log-rank
 ```
 
 ## Structure
 
-- `rsf_pure/criterion.py` — `SplitCriterion` interface + classic log-rank
-- `rsf_pure/tree.py` — `SurvivalTree`
-- `rsf_pure/rsf.py` — `RandomSurvivalForest`
-- `rsf_pure/example_custom_criterion.py` — how to plug in a custom criterion
+- `rsf_pure/criterion.py` — `PureSplitCriterion`, `PureLogRankCriterion`
+- `rsf_pure/tree.py` — `PureSurvivalTree`, `PureTreeNode`
+- `rsf_pure/rsf.py` — `PureRandomSurvivalForest`, `pure_concordance_index`
+- `rsf_pure/example_custom_criterion.py` — custom criterion example
 
 ## Quick start
 
 ```python
-from rsf_pure import RandomSurvivalForest, concordance_index
+from rsf_pure import PureRandomSurvivalForest, pure_concordance_index
 
-rsf = RandomSurvivalForest(n_estimators=100, criterion="logrank", random_state=0)
+rsf = PureRandomSurvivalForest(n_estimators=100, criterion="logrank", random_state=0)
 rsf.fit(X, time, event)
 risk = rsf.predict(X_test)
 S = rsf.predict_survival_function(X_test)
-c = concordance_index(time_test, event_test, risk)
+c = pure_concordance_index(time_test, event_test, risk)
+```
+
+## Side-by-side with sksurv
+
+```python
+from sksurv.ensemble import RandomSurvivalForest
+from rsf_pure import PureRandomSurvivalForest
 ```
 
 ## Custom criterion
 
 ```python
-from rsf_pure import SplitCriterion, RandomSurvivalForest
+from rsf_pure import PureSplitCriterion, PureRandomSurvivalForest
 
-class MyCrit(SplitCriterion):
+class MyCrit(PureSplitCriterion):
     name = "my"
     def score(self, time, event, left_mask):
-        # higher = better split
-        return float_score
+        return float_score  # higher = better
 
-rsf = RandomSurvivalForest(criterion=MyCrit(), n_estimators=50)
+rsf = PureRandomSurvivalForest(criterion=MyCrit(), n_estimators=50)
 ```
 
-Requires only NumPy.
+Requires only NumPy (Numba optional).
