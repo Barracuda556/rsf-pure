@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover
     _HAS_SKSURV_STEP = False
 
     class _StepFunction:  # type: ignore
-        """Minimal drop-in if sksurv is not installed."""
+        """Minimal drop-in if sksurv is not installed. Flat extrapolation outside x."""
 
         def __init__(self, x, y, a=1.0, b=0.0, domain=(0, None)):
             self.x = np.asarray(x, dtype=np.float64)
@@ -39,20 +39,36 @@ except ImportError:  # pragma: no cover
 
         def __call__(self, t):
             t = np.asarray(t, dtype=np.float64)
-            idx = np.searchsorted(self.x, t, side="right") - 1
-            out = np.empty_like(t, dtype=np.float64)
-            out[idx < 0] = self.a * self.y[0] + self.b if self.y.size else self.b
-            valid = idx >= 0
-            out[valid] = self.a * self.y[np.minimum(idx[valid], len(self.y) - 1)] + self.b
-            return out
+            scalar = t.ndim == 0
+            t = np.atleast_1d(t)
+            if self.y.size == 0:
+                out = np.full(t.shape, self.b)
+            else:
+                idx = np.searchsorted(self.x, t, side="right") - 1
+                idx = np.clip(idx, 0, len(self.y) - 1)
+                out = self.a * self.y[idx] + self.b
+            return float(out[0]) if scalar else out
 
 
 def _array_to_step_functions(times: np.ndarray, values: np.ndarray) -> np.ndarray:
     """Convert (n_samples, n_times) to array of StepFunction (sksurv-compatible)."""
     n = values.shape[0]
     out = np.empty(n, dtype=object)
-    for i in range(n):
-        out[i] = _StepFunction(times, values[i])
+    # Pad grid slightly so metrics evaluating at times >= last event time work
+    times = np.asarray(times, dtype=np.float64)
+    if times.size and _HAS_SKSURV_STEP:
+        # Extend last knot so domain covers common IBS evaluation times
+        t_pad = times[-1] + max(times[-1] * 0.01, 1e-6)
+        times_ext = np.concatenate([times, [t_pad]])
+        for i in range(n):
+            y_ext = np.concatenate([values[i], [values[i, -1]]])
+            try:
+                out[i] = _StepFunction(times_ext, y_ext, domain=(0.0, None))
+            except TypeError:
+                out[i] = _StepFunction(times_ext, y_ext)
+    else:
+        for i in range(n):
+            out[i] = _StepFunction(times, values[i])
     return out
 
 
@@ -228,18 +244,21 @@ class PureRandomSurvivalForest:
         """
         Risk score for each sample (higher = higher risk).
 
+        Matches sksurv RSF: sum of the ensemble cumulative hazard over
+        all event times ::
+
+            risk(x) = sum_j H_e(t_j | x)
+
         Returns
         -------
         ndarray, shape (n_samples,)
-            Ensemble cumulative hazard at the last event time
-            (same role as sksurv RSF ``predict``).
         """
         X = np.asarray(X, dtype=np.float64)
         times = self.unique_times_
         if times is None or times.size == 0:
             return np.zeros(X.shape[0], dtype=np.float64)
         H = self._ensemble_chf_array(X, times)
-        return H[:, -1]
+        return H.sum(axis=1)
 
     def predict_cumulative_hazard_function(
         self,
