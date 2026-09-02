@@ -3,6 +3,11 @@ Pure Random Survival Forest (Ishwaran-style) — NumPy only.
 
 Class names use the Pure* prefix so they never clash with
 sksurv.ensemble.RandomSurvivalForest or sklearn estimators.
+
+Prediction API mirrors scikit-survival:
+  - predict(X) -> (n_samples,) risk scores
+  - predict_survival_function(X, return_array=False)
+  - predict_cumulative_hazard_function(X, return_array=False)
 """
 
 from __future__ import annotations
@@ -15,33 +20,53 @@ import numpy as np
 from .criterion import PureSplitCriterion
 from .tree import PureSurvivalTree
 
+# Prefer sksurv StepFunction when available (needed for sksurv metrics)
+try:
+    from sksurv.functions import StepFunction as _StepFunction
+
+    _HAS_SKSURV_STEP = True
+except ImportError:  # pragma: no cover
+    _HAS_SKSURV_STEP = False
+
+    class _StepFunction:  # type: ignore
+        """Minimal drop-in if sksurv is not installed."""
+
+        def __init__(self, x, y, a=1.0, b=0.0, domain=(0, None)):
+            self.x = np.asarray(x, dtype=np.float64)
+            self.y = np.asarray(y, dtype=np.float64)
+            self.a = float(a)
+            self.b = float(b)
+
+        def __call__(self, t):
+            t = np.asarray(t, dtype=np.float64)
+            idx = np.searchsorted(self.x, t, side="right") - 1
+            out = np.empty_like(t, dtype=np.float64)
+            out[idx < 0] = self.a * self.y[0] + self.b if self.y.size else self.b
+            valid = idx >= 0
+            out[valid] = self.a * self.y[np.minimum(idx[valid], len(self.y) - 1)] + self.b
+            return out
+
+
+def _array_to_step_functions(times: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """Convert (n_samples, n_times) to array of StepFunction (sksurv-compatible)."""
+    n = values.shape[0]
+    out = np.empty(n, dtype=object)
+    for i in range(n):
+        out[i] = _StepFunction(times, values[i])
+    return out
+
 
 class PureRandomSurvivalForest:
     """
     Random Survival Forest with pluggable split criteria.
 
+    Prediction methods match ``sksurv.ensemble.RandomSurvivalForest`` so you
+    can use ``sksurv.metrics`` directly.
+
     Safe to import alongside::
 
         from sksurv.ensemble import RandomSurvivalForest
         from rsf_pure import PureRandomSurvivalForest
-
-    Parameters
-    ----------
-    n_estimators : int
-    criterion : str or PureSplitCriterion
-        "logrank" or a custom PureSplitCriterion instance.
-    max_depth, min_samples_split, min_samples_leaf, max_features
-    min_events_leaf : int
-    bootstrap : bool
-    max_samples : float, int or None
-    oob_score : bool
-    n_jobs : int
-        Parallel tree builds (-1 = all CPUs). Threads are used so NumPy work
-        can release the GIL without pickling issues.
-    random_state : int or None
-    max_candidate_splits : int or None
-        Default 32 — limits thresholds tried per feature (speed).
-        Set None to scan all unique values.
     """
 
     def __init__(
@@ -77,6 +102,7 @@ class PureRandomSurvivalForest:
         self.estimators_: List[PureSurvivalTree] = []
         self.feature_importances_: Optional[np.ndarray] = None
         self.unique_times_: Optional[np.ndarray] = None
+        self.event_times_: Optional[np.ndarray] = None  # alias of unique_times_
         self.oob_score_: Optional[float] = None
         self.n_features_in_: Optional[int] = None
 
@@ -104,6 +130,7 @@ class PureRandomSurvivalForest:
         n, p = X.shape
         self.n_features_in_ = p
         self.unique_times_ = np.unique(time[event])
+        self.event_times_ = self.unique_times_
 
         rng = np.random.default_rng(self.random_state)
         seeds = rng.integers(0, 2**31 - 1, size=self.n_estimators)
@@ -177,42 +204,109 @@ class PureRandomSurvivalForest:
         risk[valid] /= counts[valid]
         return pure_concordance_index(time[valid], event[valid], risk[valid])
 
-    def predict_cumulative_hazard(
-        self,
-        X: np.ndarray,
-        times: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        X = np.asarray(X, dtype=np.float64)
-        if times is None:
-            times = self.unique_times_
-        times = np.asarray(times, dtype=np.float64)
+    # ---------- sksurv-compatible predictions ----------
 
+    def _ensemble_chf_array(
+        self, X: np.ndarray, times: np.ndarray
+    ) -> np.ndarray:
         H = np.zeros((X.shape[0], times.size), dtype=np.float64)
         for tree in self.estimators_:
             H += tree.predict_cumulative_hazard(X, times)
-        H /= len(self.estimators_)
+        H /= max(len(self.estimators_), 1)
         return H
+
+    def _ensemble_sf_array(
+        self, X: np.ndarray, times: np.ndarray
+    ) -> np.ndarray:
+        S = np.zeros((X.shape[0], times.size), dtype=np.float64)
+        for tree in self.estimators_:
+            S += tree.predict_survival_function(X, times)
+        S /= max(len(self.estimators_), 1)
+        return S
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        Risk score for each sample (higher = higher risk).
+
+        Returns
+        -------
+        ndarray, shape (n_samples,)
+            Ensemble cumulative hazard at the last event time
+            (same role as sksurv RSF ``predict``).
+        """
+        X = np.asarray(X, dtype=np.float64)
+        times = self.unique_times_
+        if times is None or times.size == 0:
+            return np.zeros(X.shape[0], dtype=np.float64)
+        H = self._ensemble_chf_array(X, times)
+        return H[:, -1]
+
+    def predict_cumulative_hazard_function(
+        self,
+        X: np.ndarray,
+        return_array: bool = False,
+    ):
+        """
+        Predict cumulative hazard function (Nelson–Aalen ensemble).
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+        return_array : bool, default False
+            If True, return ndarray (n_samples, n_event_times).
+            If False, return ndarray of StepFunction (sksurv-compatible).
+
+        Returns
+        -------
+        cum_hazard : ndarray
+        """
+        X = np.asarray(X, dtype=np.float64)
+        times = self.unique_times_
+        if times is None:
+            raise RuntimeError("Model is not fitted")
+        arr = self._ensemble_chf_array(X, times)
+        if return_array:
+            return arr
+        return _array_to_step_functions(times, arr)
 
     def predict_survival_function(
         self,
         X: np.ndarray,
-        times: Optional[np.ndarray] = None,
+        return_array: bool = False,
+    ):
+        """
+        Predict survival function (Kaplan–Meier ensemble average).
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+        return_array : bool, default False
+            If True, return ndarray (n_samples, n_event_times).
+            If False, return ndarray of StepFunction (sksurv-compatible).
+
+        Returns
+        -------
+        survival : ndarray
+        """
+        X = np.asarray(X, dtype=np.float64)
+        times = self.unique_times_
+        if times is None:
+            raise RuntimeError("Model is not fitted")
+        arr = self._ensemble_sf_array(X, times)
+        if return_array:
+            return arr
+        return _array_to_step_functions(times, arr)
+
+    # Backwards-compatible aliases (previous pure-API names)
+    def predict_cumulative_hazard(
+        self, X: np.ndarray, times: Optional[np.ndarray] = None
     ) -> np.ndarray:
+        """Alias: always returns 2-d array (optionally on custom ``times``)."""
         X = np.asarray(X, dtype=np.float64)
         if times is None:
             times = self.unique_times_
         times = np.asarray(times, dtype=np.float64)
-
-        S = np.zeros((X.shape[0], times.size), dtype=np.float64)
-        for tree in self.estimators_:
-            S += tree.predict_survival_function(X, times)
-        S /= len(self.estimators_)
-        return S
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Ensemble risk = mean CHF at last grid time (higher = higher risk)."""
-        H = self.predict_cumulative_hazard(X)
-        return H[:, -1]
+        return self._ensemble_chf_array(X, times)
 
 
 def pure_concordance_index(
@@ -230,7 +324,6 @@ def pure_concordance_index(
     event = np.asarray(event).astype(bool)
     risk = np.asarray(risk, dtype=np.float64)
 
-    # Sort by time ascending — then only need to look at later samples
     order = np.argsort(time, kind="mergesort")
     time = time[order]
     event = event[order]
@@ -243,14 +336,11 @@ def pure_concordance_index(
     for i in range(n):
         if not event[i]:
             continue
-        # j with time[j] > time[i]
-        # (ties in time with events are skipped, same as before)
         ti = time[i]
         ri = risk[i]
         for j in range(i + 1, n):
             if time[j] == ti:
                 continue
-            # time[j] > ti
             permissible += 1.0
             rj = risk[j]
             if ri > rj:
