@@ -75,9 +75,10 @@ def main():
     c_c = pure_concordance_index(time[test], event[test], risk_c)
     print(f"C-index (custom):  {c_c:.4f}")
 
-    times_grid = np.linspace(0, np.percentile(time, 90), 20)
-    S = rsf_lr.predict_survival_function(X[test[:1]], times_grid)
+    S = rsf_lr.predict_survival_function(X[test[:1]], return_array=True)
     print("\nS(t) first test sample (first 5 pts):", np.round(S[0, :5], 3))
+    fns = rsf_lr.predict_survival_function(X[test[:1]], return_array=False)
+    print("StepFunction .x length:", len(fns[0].x))
 
 
 if __name__ == "__main__":
