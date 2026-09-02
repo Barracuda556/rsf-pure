@@ -20,55 +20,44 @@ import numpy as np
 from .criterion import PureSplitCriterion
 from .tree import PureSurvivalTree
 
-# Prefer sksurv StepFunction when available (needed for sksurv metrics)
-try:
-    from sksurv.functions import StepFunction as _StepFunction
 
-    _HAS_SKSURV_STEP = True
-except ImportError:  # pragma: no cover
-    _HAS_SKSURV_STEP = False
+class _PureStepFunction:
+    """
+    Step function with flat extrapolation outside the knot range.
 
-    class _StepFunction:  # type: ignore
-        """Minimal drop-in if sksurv is not installed. Flat extrapolation outside x."""
+    sksurv.functions.StepFunction raises if ``t`` is outside its domain.
+    IBS grids often include times beyond the last *event* time in
+    ``unique_times_`` (e.g. censored times), so we always use this
+    extrapolating implementation. Interface matches sksurv StepFunction
+    (``.x``, ``.y``, ``__call__``).
+    """
 
-        def __init__(self, x, y, a=1.0, b=0.0, domain=(0, None)):
-            self.x = np.asarray(x, dtype=np.float64)
-            self.y = np.asarray(y, dtype=np.float64)
-            self.a = float(a)
-            self.b = float(b)
+    def __init__(self, x, y, a=1.0, b=0.0, domain=(0, None)):
+        self.x = np.asarray(x, dtype=np.float64)
+        self.y = np.asarray(y, dtype=np.float64)
+        self.a = float(a)
+        self.b = float(b)
 
-        def __call__(self, t):
-            t = np.asarray(t, dtype=np.float64)
-            scalar = t.ndim == 0
-            t = np.atleast_1d(t)
-            if self.y.size == 0:
-                out = np.full(t.shape, self.b)
-            else:
-                idx = np.searchsorted(self.x, t, side="right") - 1
-                idx = np.clip(idx, 0, len(self.y) - 1)
-                out = self.a * self.y[idx] + self.b
-            return float(out[0]) if scalar else out
+    def __call__(self, t):
+        t = np.asarray(t, dtype=np.float64)
+        scalar = t.ndim == 0
+        t = np.atleast_1d(t)
+        if self.y.size == 0:
+            out = np.full(t.shape, self.b)
+        else:
+            idx = np.searchsorted(self.x, t, side="right") - 1
+            idx = np.clip(idx, 0, len(self.y) - 1)
+            out = self.a * self.y[idx] + self.b
+        return float(out[0]) if scalar else out
 
 
 def _array_to_step_functions(times: np.ndarray, values: np.ndarray) -> np.ndarray:
-    """Convert (n_samples, n_times) to array of StepFunction (sksurv-compatible)."""
+    """Convert (n_samples, n_times) to array of step functions."""
     n = values.shape[0]
     out = np.empty(n, dtype=object)
-    # Pad grid slightly so metrics evaluating at times >= last event time work
     times = np.asarray(times, dtype=np.float64)
-    if times.size and _HAS_SKSURV_STEP:
-        # Extend last knot so domain covers common IBS evaluation times
-        t_pad = times[-1] + max(times[-1] * 0.01, 1e-6)
-        times_ext = np.concatenate([times, [t_pad]])
-        for i in range(n):
-            y_ext = np.concatenate([values[i], [values[i, -1]]])
-            try:
-                out[i] = _StepFunction(times_ext, y_ext, domain=(0.0, None))
-            except TypeError:
-                out[i] = _StepFunction(times_ext, y_ext)
-    else:
-        for i in range(n):
-            out[i] = _StepFunction(times, values[i])
+    for i in range(n):
+        out[i] = _PureStepFunction(times, values[i])
     return out
 
 
