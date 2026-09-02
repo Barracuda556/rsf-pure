@@ -1,52 +1,53 @@
 """
-Random Survival Forest (Ishwaran-style) — pure NumPy.
+Pure Random Survival Forest (Ishwaran-style) — NumPy only.
+
+Class names use the Pure* prefix so they never clash with
+sksurv.ensemble.RandomSurvivalForest or sklearn estimators.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Union
 from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional, Union
 
 import numpy as np
 
-from .criterion import SplitCriterion, get_criterion
-from .tree import SurvivalTree
+from .criterion import PureSplitCriterion
+from .tree import PureSurvivalTree
 
 
-class RandomSurvivalForest:
+class PureRandomSurvivalForest:
     """
-    Random Survival Forest.
+    Random Survival Forest with pluggable split criteria.
+
+    Safe to import alongside::
+
+        from sksurv.ensemble import RandomSurvivalForest
+        from rsf_pure import PureRandomSurvivalForest
 
     Parameters
     ----------
     n_estimators : int
-        Number of trees.
-    criterion : str or SplitCriterion
-        Split criterion ("logrank" or custom instance).
-    max_depth : int or None
-    min_samples_split : int
-    min_samples_leaf : int
-    max_features : "sqrt", "log2", int, float or None
+    criterion : str or PureSplitCriterion
+        "logrank" or a custom PureSplitCriterion instance.
+    max_depth, min_samples_split, min_samples_leaf, max_features
     min_events_leaf : int
-        Soft constraint on events in terminal nodes.
     bootstrap : bool
-        Draw bootstrap samples (default True).
-    max_samples : float or int or None
-        Fraction or absolute size of bootstrap sample.
-        None → n_samples (classic bootstrap).
+    max_samples : float, int or None
     oob_score : bool
-        Compute OOB concordance (simple) after fit.
     n_jobs : int
-        Parallel trees (-1 = all cores).
+        Parallel tree builds (-1 = all CPUs). Threads are used so NumPy work
+        can release the GIL without pickling issues.
     random_state : int or None
     max_candidate_splits : int or None
-        Limit candidate thresholds per feature (speed).
+        Default 32 — limits thresholds tried per feature (speed).
+        Set None to scan all unique values.
     """
 
     def __init__(
         self,
         n_estimators: int = 100,
-        criterion: Union[str, SplitCriterion] = "logrank",
+        criterion: Union[str, PureSplitCriterion] = "logrank",
         max_depth: Optional[int] = None,
         min_samples_split: int = 6,
         min_samples_leaf: int = 3,
@@ -57,7 +58,7 @@ class RandomSurvivalForest:
         oob_score: bool = False,
         n_jobs: int = 1,
         random_state: Optional[int] = None,
-        max_candidate_splits: Optional[int] = None,
+        max_candidate_splits: Optional[int] = 32,
     ):
         self.n_estimators = n_estimators
         self.criterion = criterion
@@ -73,7 +74,7 @@ class RandomSurvivalForest:
         self.random_state = random_state
         self.max_candidate_splits = max_candidate_splits
 
-        self.estimators_: List[SurvivalTree] = []
+        self.estimators_: List[PureSurvivalTree] = []
         self.feature_importances_: Optional[np.ndarray] = None
         self.unique_times_: Optional[np.ndarray] = None
         self.oob_score_: Optional[float] = None
@@ -95,7 +96,7 @@ class RandomSurvivalForest:
         X: np.ndarray,
         time: np.ndarray,
         event: np.ndarray,
-    ) -> "RandomSurvivalForest":
+    ) -> "PureRandomSurvivalForest":
         X = np.asarray(X, dtype=np.float64)
         time = np.asarray(time, dtype=np.float64).ravel()
         event = np.asarray(event).ravel().astype(bool)
@@ -107,7 +108,6 @@ class RandomSurvivalForest:
         rng = np.random.default_rng(self.random_state)
         seeds = rng.integers(0, 2**31 - 1, size=self.n_estimators)
 
-        # sample size
         if self.max_samples is None:
             sample_size = n
         elif isinstance(self.max_samples, float):
@@ -124,7 +124,7 @@ class RandomSurvivalForest:
                 if sample_size < n:
                     idx = local_rng.choice(n, size=sample_size, replace=False)
 
-            tree = SurvivalTree(random_state=int(seed), **self._tree_params())
+            tree = PureSurvivalTree(random_state=int(seed), **self._tree_params())
             tree.fit(X[idx], time[idx], event[idx])
             oob_mask = np.ones(n, dtype=bool)
             oob_mask[idx] = False
@@ -134,8 +134,6 @@ class RandomSurvivalForest:
         if n_jobs is None or n_jobs == 1:
             results = [_fit_one(int(s)) for s in seeds]
         else:
-            # Thread pool is safer (no pickling of local closures) and enough
-            # because the heavy work is NumPy (releases GIL often).
             max_workers = None if n_jobs == -1 else n_jobs
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
                 results = list(ex.map(_fit_one, [int(s) for s in seeds]))
@@ -143,7 +141,6 @@ class RandomSurvivalForest:
         self.estimators_ = [t for t, _ in results]
         oob_masks = [m for _, m in results]
 
-        # feature importances (average)
         imp = np.zeros(p, dtype=np.float64)
         for t in self.estimators_:
             if t.feature_importances_ is not None:
@@ -163,7 +160,6 @@ class RandomSurvivalForest:
         event: np.ndarray,
         oob_masks: List[np.ndarray],
     ) -> float:
-        """Simple Harrell C on OOB risk scores (higher risk = higher H)."""
         n = X.shape[0]
         risk = np.zeros(n, dtype=np.float64)
         counts = np.zeros(n, dtype=np.float64)
@@ -179,20 +175,13 @@ class RandomSurvivalForest:
         if valid.sum() < 2:
             return np.nan
         risk[valid] /= counts[valid]
-        return concordance_index(time[valid], event[valid], risk[valid])
-
-    # ---------- predictions ----------
+        return pure_concordance_index(time[valid], event[valid], risk[valid])
 
     def predict_cumulative_hazard(
         self,
         X: np.ndarray,
         times: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """
-        Ensemble CHF = average of tree CHFs.
-
-        Returns (n_samples, n_times)
-        """
         X = np.asarray(X, dtype=np.float64)
         if times is None:
             times = self.unique_times_
@@ -209,10 +198,6 @@ class RandomSurvivalForest:
         X: np.ndarray,
         times: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """
-        Ensemble S(t) = average of tree KM curves.
-        (Ishwaran also uses exp(-ensemble H); both are common.)
-        """
         X = np.asarray(X, dtype=np.float64)
         if times is None:
             times = self.unique_times_
@@ -225,26 +210,31 @@ class RandomSurvivalForest:
         return S
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """
-        Risk score = ensemble cumulative hazard at last time point.
-        Higher = higher risk.
-        """
+        """Ensemble risk = mean CHF at last grid time (higher = higher risk)."""
         H = self.predict_cumulative_hazard(X)
         return H[:, -1]
 
 
-def concordance_index(
+def pure_concordance_index(
     time: np.ndarray,
     event: np.ndarray,
     risk: np.ndarray,
 ) -> float:
     """
-    Harrell's C-index.
-    risk: higher value = higher predicted risk (worse survival).
+    Harrell's C-index (higher risk = worse survival).
+
+    Named ``pure_concordance_index`` so it does not shadow
+    ``sksurv.metrics.concordance_index_censored``.
     """
     time = np.asarray(time, dtype=np.float64)
     event = np.asarray(event).astype(bool)
     risk = np.asarray(risk, dtype=np.float64)
+
+    # Sort by time ascending — then only need to look at later samples
+    order = np.argsort(time, kind="mergesort")
+    time = time[order]
+    event = event[order]
+    risk = risk[order]
 
     n = time.size
     concordant = 0.0
@@ -253,18 +243,19 @@ def concordance_index(
     for i in range(n):
         if not event[i]:
             continue
-        for j in range(n):
-            if time[j] < time[i]:
+        # j with time[j] > time[i]
+        # (ties in time with events are skipped, same as before)
+        ti = time[i]
+        ri = risk[i]
+        for j in range(i + 1, n):
+            if time[j] == ti:
                 continue
-            if time[j] == time[i] and event[j]:
-                continue  # tie in time with event — skip or handle as tie
-            if time[j] == time[i]:
-                continue
-            # time[j] > time[i], i had event
+            # time[j] > ti
             permissible += 1.0
-            if risk[i] > risk[j]:
+            rj = risk[j]
+            if ri > rj:
                 concordant += 1.0
-            elif risk[i] == risk[j]:
+            elif ri == rj:
                 concordant += 0.5
 
     if permissible == 0:
